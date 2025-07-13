@@ -26,7 +26,7 @@ MAX_RETRIES         = 3             # extra attempts per page
 
 SYSTEM_PROMPT = (
     "The attached image is a section from a book or a long document. "
-    "Process the entire section so that all real content is preserved - including chapter titles, subtitles, and any relevant body text. "
+    "Process the entire section so that all real content is preserved - including clear chapter titles and any relevant body text. "
     "Do NOT include page numbers, running heads, footers, or any elements that are not genuine content. "
     "If the section is empty or contains no meaningful text, return an entirely empty string only - do not write any explanations, meta-comments, or placeholder text. "
     "In addition, slightly modernize the text: update any outdated spelling or archaic words to standard modern English where appropriate, ensuring readability while preserving the original meaning and tone. "
@@ -135,7 +135,6 @@ async def ocr_page(
     prev_tail: str | None = None,
 ) -> str:
     """Send *one* page (plus context) to GPT-4o Vision and return its text."""
-    reserved = IMAGE_TOKEN_FALLOUT + len(image_b64) // 4
     # Estimate tokens per OpenAI Vision formula: 85 + 170 * tiles
     img_bytes = base64.b64decode(image_b64)
     w, h = Image.open(io.BytesIO(img_bytes)).size
@@ -216,13 +215,13 @@ async def run_pipeline(
         if out_path and pageno % SAVE_EVERY == 0:
             # append last 5 pages to the *main* file
             with open(out_path, "a", encoding="utf-8") as f:
-                f.write("".join(buffer_pages))
+                f.write(" ".join(buffer_pages))
             buffer_pages.clear()
         
             # also write full checkpoint with everything so far
             checkpoint = out_path.with_name(f"{out_path.stem}_sofar_page{pageno}.txt")
             with open(checkpoint, "w", encoding="utf-8") as cp:
-                cp.write("\n\n".join(transcript) + "\n")
+                cp.write(" ".join(transcript) + "\n")
         
             log.info("Progress saved through page %d → %s  (checkpoint → %s)",
                      pageno, out_path, checkpoint)
@@ -230,10 +229,10 @@ async def run_pipeline(
 
     if out_path and buffer_pages:
         with open(out_path, "a", encoding="utf-8") as f:
-            f.write("\n\n".join(buffer_pages) + "\n\n")
+            f.write(" ".join(buffer_pages))
         log.info("Final pages written → %s", out_path)
-
-    return "\n\n".join(transcript)
+    global LAST_TEXT
+    LAST_TEXT = " ".join(transcript)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public convenience wrappers
