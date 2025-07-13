@@ -193,6 +193,7 @@ async def ocr_page(
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline
 # ──────────────────────────────────────────────────────────────────────────────
+
 async def run_pipeline(
     pdf_path : Path,
     out_path : Path | None = None,
@@ -231,8 +232,11 @@ async def run_pipeline(
         with open(out_path, "a", encoding="utf-8") as f:
             f.write(" ".join(buffer_pages))
         log.info("Final pages written → %s", out_path)
-    global LAST_TEXT
-    LAST_TEXT = " ".join(transcript)
+
+    global full_text 
+    full_text = " ".join(transcript)
+    return " ".join(transcript)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Public convenience wrappers
@@ -294,8 +298,7 @@ def easy_ocr(
 
     if error_holder:                            # re-raise inside caller thread
         raise error_holder[0]
-    return result_holder[0]
-
+    return None
 
 
 
