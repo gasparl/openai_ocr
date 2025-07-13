@@ -13,12 +13,28 @@ import io
 from PIL import Image
 import random
 
+
+# ─── Model catalogue & automatic token-bucket limit ────────────────────────────
+TPM_LIMITS: dict[str, int] = {
+    "gpt-4.1":     30_000,
+    "gpt-4o":      30_000,
+    "gpt-4o-mini": 200_000,
+    "o1":          30_000,
+    "o1-mini":     200_000,
+    "o1-pro":      30_000,
+    "o3-mini":     200_000,
+}
+
+DEFAULT_MODEL = "gpt-4o"               # global default
+MODEL_NAME = os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
+TPM_LIMIT  = TPM_LIMITS[MODEL_NAME]
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration constants
 # ──────────────────────────────────────────────────────────────────────────────
 CONTEXT_WINDOW      = 128_000
 IMAGE_TOKEN_FALLOUT = 110           # pessimistic prompt overhead per image
-TPM_LIMIT           = 250_000       # tokens-per-minute quota
 CONCURRENCY_LIMIT   = 5             # reserved for future parallelism
 SAVE_EVERY          = 5             # pages before flushing to disk
 TAIL_SENTENCES      = 3             # context sentences passed to next page
@@ -30,10 +46,9 @@ SYSTEM_PROMPT = (
     "Do NOT include page numbers, running heads, footers, or any elements that are not genuine content. "
     "If the section is empty or contains no meaningful text, return an entirely empty string only - do not write any explanations, meta-comments, or placeholder text. "
     "In addition, slightly modernize the text: update any outdated spelling or archaic words to standard modern English where appropriate, ensuring readability while preserving the original meaning and tone. "
-    "Return plain text only**."
+    "Return plain text only."
 )
 
-MODEL_NAME = "gpt-4o-mini"
 
 log = logging.getLogger(__name__)
 logging.basicConfig(
@@ -82,7 +97,7 @@ class TokenLimiter:
             diff = real_tokens - reserved           # ← fixed (was IMAGE_TOKEN_FALLOUT) :contentReference[oaicite:8]{index=8}
             if diff < 0:                            # over-reserved
                 for _ in range(min(-diff, len(self._tokens))):
-                    self._tokens.pop(0)
+                    self._tokens.pop()
             elif diff > 0:                          # under-reserved
                 self._tokens.extend([time.monotonic()] * diff)
 
@@ -139,8 +154,7 @@ async def ocr_page(
     img_bytes = base64.b64decode(image_b64)
     w, h = Image.open(io.BytesIO(img_bytes)).size
     tiles = -(-w // 512) * -(-h // 512)       # ceiling division
-    reserved = 85 + 170 * tiles
-    reserved = min(reserved, TPM_LIMIT)       # never exceed bucket
+    reserved = int(1.05 * (85 + 170 * tiles))
     
     
     await tpm_limiter.reserve(reserved)
@@ -180,7 +194,7 @@ async def ocr_page(
 
             except (BadRequestError, RateLimitError, APIConnectionError,
                     APITimeoutError, OpenAIError) as exc:
-                # release the reserved bucket before retrying
+                # Roll back the *reserved* tokens – the request never succeeded
                 await tpm_limiter.commit(0, reserved)
             
                 if attempt >= MAX_RETRIES:
@@ -233,8 +247,6 @@ async def run_pipeline(
             f.write(" ".join(buffer_pages))
         log.info("Final pages written → %s", out_path)
 
-    global full_text 
-    full_text = " ".join(transcript)
     return " ".join(transcript)
 
 
@@ -298,7 +310,7 @@ def easy_ocr(
 
     if error_holder:                            # re-raise inside caller thread
         raise error_holder[0]
-    return None
+    return result_holder[0] if result_holder else ""
 
 
 
@@ -311,10 +323,23 @@ def _parse_args(argv: Sequence[str]):
     p.add_argument("--input", "-i", default="input.pdf", help="Input PDF file")
     p.add_argument("--output", "-o", help="Output text file")
     p.add_argument("--dpi", type=int, default=200, help="Render DPI (default 200)")
+    p.add_argument(
+        "--model",
+        default=os.getenv("OPENAI_MODEL", DEFAULT_MODEL),
+        choices=list(TPM_LIMITS.keys()),
+        help=f"OpenAI model to use (default: {DEFAULT_MODEL})",
+    )    
     return p.parse_args(argv)
 
 def _cli_entry(argv: Sequence[str]) -> None:
     args = _parse_args(argv)
+    # Bind the chosen model & TPM limit to the globals other code expects+    
+    global MODEL_NAME, TPM_LIMIT, tpm_limiter, sem_api
+    MODEL_NAME = args.model
+    TPM_LIMIT  = TPM_LIMITS[MODEL_NAME]
+    tpm_limiter = TokenLimiter(TPM_LIMIT)
+    sem_api     = asyncio.Semaphore(CONCURRENCY_LIMIT)
+    
     pdf_path = Path(args.input)
     if args.output:
         out_path = Path(args.output)
