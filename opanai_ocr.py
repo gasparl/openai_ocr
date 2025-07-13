@@ -25,7 +25,7 @@ TPM_LIMITS: dict[str, int] = {
     "o3-mini":     200_000,
 }
 
-DEFAULT_MODEL = "gpt-4o"               # global default
+DEFAULT_MODEL = "gpt-4o-mini"               # global default
 MODEL_NAME = os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
 TPM_LIMIT  = TPM_LIMITS[MODEL_NAME]
 
