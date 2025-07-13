@@ -1,63 +1,50 @@
-#!/usr/bin/env python3
-"""
-PDF-to-Text extractor with OpenAI post-processing.
-- Extracts text from a PDF.
-- Splits and cleans up chunks.
-- Sends chunks to OpenAI for "intelligent OCR" (removes headers, etc.).
-- Outputs clean text with slightly modernized language.
-"""
+#!/usr/bin/env python
+# opanai_ocr.py  – fixed & renamed easy_ocr()
 
-import os
-import re
-import asyncio
-import json
-import logging
-import time
-import random
+from __future__ import annotations
+import asyncio, base64, json, logging, os, re, sys, time, datetime
 from pathlib import Path
-from datetime import datetime
-from functools import lru_cache
-from collections import deque
-from typing import List
+from typing import List, Sequence
 
-import pdfplumber
-import tiktoken
-from openai import AsyncOpenAI, OpenAIError, RateLimitError, APIConnectionError, APITimeoutError
+import fitz                          # PyMuPDF
+from openai import AsyncOpenAI
+from openai import BadRequestError, OpenAIError, RateLimitError, APIConnectionError, APITimeoutError
+import io
+from PIL import Image
+import random
 
-# ---------- Model list & settings ----------
-CONTEXT_WINDOWS = {
-    "gpt-4o-2024-05-13": 128_000,
-    "gpt-4-turbo-2024-04-09": 128_000,
-    "gpt-3.5-turbo-0125": 16_384,
-}
-TPM_LIMITS = {
-    "gpt-4o-2024-05-13": 30_000,
-    "gpt-4-turbo-2024-04-09": 30_000,
-    "gpt-3.5-turbo-0125": 180_000,
-}
-AVAILABLE_MODELS = list(CONTEXT_WINDOWS.keys())
-DEFAULT_MODEL = "gpt-4o-2024-05-13"
-WINDOW = 60
-CHUNK_TOKENS = 800
-MAX_COMPLETION_TOKENS = 256
-RETRIES, CONCURRENCY, WRITE_EVERY = 5, 2, 5
+# ──────────────────────────────────────────────────────────────────────────────
+# Configuration constants
+# ──────────────────────────────────────────────────────────────────────────────
+CONTEXT_WINDOW      = 128_000
+IMAGE_TOKEN_FALLOUT = 110           # pessimistic prompt overhead per image
+TPM_LIMIT           = 250_000       # tokens-per-minute quota
+CONCURRENCY_LIMIT   = 5             # reserved for future parallelism
+SAVE_EVERY          = 5             # pages before flushing to disk
+TAIL_SENTENCES      = 3             # context sentences passed to next page
+MAX_RETRIES         = 3             # extra attempts per page
 
 SYSTEM_PROMPT = (
-    "The following text is a section from a book or a long document. "
-    "Process the entire section so that all real content is preserved—including chapter titles, subtitles, and any relevant body text. "
+    "The attached image is a section from a book or a long document. "
+    "Process the entire section so that all real content is preserved - including chapter titles, subtitles, and any relevant body text. "
     "Do NOT include page numbers, running heads, footers, or any elements that are not genuine content. "
-    "If the section is empty or contains no meaningful text, return an entirely empty string only—do not write any explanations, meta-comments, or placeholder text. "
+    "If the section is empty or contains no meaningful text, return an entirely empty string only - do not write any explanations, meta-comments, or placeholder text. "
     "In addition, slightly modernize the text: update any outdated spelling or archaic words to standard modern English where appropriate, ensuring readability while preserving the original meaning and tone. "
-    "Your output must contain only the preserved, modernized content, with no added explanations, meta-information, or formatting such as Markdown code fences. Return plain text only."
+    "Return plain text only**."
 )
 
-# ---------- Logging ----------
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+MODEL_NAME = "gpt-4o-mini"
+
 log = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
 
-# ---------- API client ----------
+# ──────────────────────────────────────────────────────────────────────────────
+# API client
+# ──────────────────────────────────────────────────────────────────────────────
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     try:
@@ -68,184 +55,281 @@ if not api_key:
 
 client = AsyncOpenAI(api_key=api_key)
 
-# ---------- Token helpers ----------
-@lru_cache
-def _encoder(model: str = DEFAULT_MODEL):
-    try:
-        return tiktoken.encoding_for_model(model)
-    except KeyError:
-        return tiktoken.get_encoding("cl100k_base")
-
-def token_len(txt: str, model: str = DEFAULT_MODEL) -> int:
-    return len(_encoder(model).encode(txt))
-
-def context_window(model: str) -> int:
-    return CONTEXT_WINDOWS.get(model, 128_000)
-
-# ---------- PDF Text Extraction ----------
-def read_pdf(path: Path) -> List[str]:
-    paragraphs = []
-    with pdfplumber.open(str(path)) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text:
-                # Split into paragraphs, removing empty/short lines
-                for para in re.split(r'\n{2,}', text):
-                    clean = para.strip()
-                    if len(clean) >= 10:
-                        paragraphs.append(clean)
-    return paragraphs
-
-def split_paragraphs(paragraphs: List[str], model: str) -> List[str]:
-    chunks, current, tokens = [], [], 0
-    for p in paragraphs:
-        p_tokens = token_len(p, model) + 1
-        if p_tokens > CHUNK_TOKENS:
-            # Split long paragraph by sentences
-            sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", p) if s.strip()]
-            buf, buf_tokens = [], 0
-            for s in sents:
-                s_tok = token_len(s, model) + 1
-                if buf_tokens + s_tok > CHUNK_TOKENS and buf:
-                    chunks.append(" ".join(buf)); buf, buf_tokens = [], 0
-                buf.append(s); buf_tokens += s_tok
-            if buf: chunks.append(" ".join(buf))
-            continue
-        if tokens + p_tokens > CHUNK_TOKENS and current:
-            chunks.append("\n".join(current)); current, tokens = [], 0
-        current.append(p); tokens += p_tokens
-    if current: chunks.append("\n".join(current))
-    return chunks
-
-def strip_code_fence(text: str) -> str:
-    return re.sub(r"^```(?:\w+)?\s*|\s*```$", "", text.strip(), flags=re.S)
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Token-per-minute limiter
+# ──────────────────────────────────────────────────────────────────────────────
 class TokenLimiter:
-    def __init__(self, model: str):
-        self.limit = TPM_LIMITS.get(model, 30_000)
-        self.window = WINDOW
-        self.usage = deque()
-        self.lock = asyncio.Lock()
+    """Sliding-window token bucket for TPM limits."""
+    def __init__(self, tpm_limit: int) -> None:
+        self._tpm   = tpm_limit
+        self._lock  = asyncio.Lock()
+        self._tokens: List[float] = []               # 1 timestamp per committed token
 
-    async def throttle(self, tokens_budget: int):
-        async with self.lock:
-            now = time.time()
-            while self.usage and now - self.usage[0][0] > self.window:
-                self.usage.popleft()
-            used = sum(t for _, t in self.usage)
-            if used + tokens_budget > self.limit:
-                sleep = self.window - (now - self.usage[0][0]) + 0.05
-                sleep = max(sleep, 0.1)
-                log.info(f"TPM cap reached; sleeping {sleep:.1f}s")
-                await asyncio.sleep(sleep)
-            self.usage.append((time.time(), tokens_budget))
+    async def reserve(self, est_tokens: int) -> None:
+        """Block until capacity for *est_tokens* exists inside the rolling 60-s window."""
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                self._tokens = [t for t in self._tokens if now - t < 60]
+                if len(self._tokens) + est_tokens <= self._tpm:
+                    self._tokens.extend([now] * est_tokens)
+                    return
+            await asyncio.sleep(0.25)
 
-    async def commit(self, real_tokens: int):
-        async with self.lock:
-            if self.usage:
-                self.usage.pop()
-            self.usage.append((time.time(), real_tokens))
+    async def commit(self, real_tokens: int, reserved: int) -> None:
+        """Reconcile the bucket after usage is known."""
+        async with self._lock:
+            diff = real_tokens - reserved           # ← fixed (was IMAGE_TOKEN_FALLOUT) :contentReference[oaicite:8]{index=8}
+            if diff < 0:                            # over-reserved
+                for _ in range(min(-diff, len(self._tokens))):
+                    self._tokens.pop(0)
+            elif diff > 0:                          # under-reserved
+                self._tokens.extend([time.monotonic()] * diff)
 
-sem = asyncio.Semaphore(CONCURRENCY)
+tpm_limiter = TokenLimiter(TPM_LIMIT)
+sem_api     = asyncio.Semaphore(CONCURRENCY_LIMIT)
 
-async def extract(chunk: str, model: str,
-                  limiter: TokenLimiter, idx: int, total: int) -> str:
-    async with sem:
-        prompt_toks = token_len(SYSTEM_PROMPT, model)
-        chunk_toks  = token_len(chunk, model)
-        avail       = max(0, context_window(model) - prompt_toks - chunk_toks)
-        max_comp    = max(32, min(MAX_COMPLETION_TOKENS, avail))
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def iter_page_images_b64(pdf_path: Path, dpi: int = 200):
+    """Yield each page rendered to PNG then Base64-encoded."""
+    with fitz.open(pdf_path) as doc:
+        zoom = dpi / 72
+        mat  = fitz.Matrix(zoom, zoom)
+        for page in doc:
+            pix = page.get_pixmap(matrix=mat)
+            png_bytes = pix.tobytes("png")
+            yield base64.b64encode(png_bytes).decode()
 
-        await limiter.throttle(prompt_toks + chunk_toks + max_comp)
-        for attempt in range(RETRIES):
+# Sentence ends = period, exclamation mark, or question mark
+_SENT_DELIM_RE = re.compile(r"(?<=[.!?])\s+")
+
+def last_sentences(text: str, n: int = 3, *, fallback_words: int = 40) -> str:
+    """
+    Return the last *n* sentences from *text*.
+
+    • If the block has fewer than *n* sentences, the whole block is returned.  
+    • If **no** sentence-terminating punctuation appears, we return the last
+      *fallback_words* words instead, so the caller still gets usable context.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    # Split on sentence boundaries (handles spaces and newlines after punctuation)
+    sentences = [s for s in re.split(_SENT_DELIM_RE, text) if s]
+
+    if sentences:
+        return " ".join(sentences[-n:])
+    else:
+        # Fallback when no “.” “!” or “?” exists in the block
+        return " ".join(text.split()[-fallback_words:])
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core worker
+# ──────────────────────────────────────────────────────────────────────────────
+async def ocr_page(
+    image_b64: str,
+    page_num : int,
+    prev_tail: str | None = None,
+) -> str:
+    """Send *one* page (plus context) to GPT-4o Vision and return its text."""
+    reserved = IMAGE_TOKEN_FALLOUT + len(image_b64) // 4
+    # Estimate tokens per OpenAI Vision formula: 85 + 170 * tiles
+    img_bytes = base64.b64decode(image_b64)
+    w, h = Image.open(io.BytesIO(img_bytes)).size
+    tiles = -(-w // 512) * -(-h // 512)       # ceiling division
+    reserved = 85 + 170 * tiles
+    reserved = min(reserved, TPM_LIMIT)       # never exceed bucket
+    
+    
+    await tpm_limiter.reserve(reserved)
+
+    async with sem_api:
+        for attempt in range(MAX_RETRIES + 1):      # bounded retry loop
             try:
-                log.info(f"Section {idx}/{total} (try {attempt+1})")
-                resp = await client.chat.completions.create(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {"role": "user",   "content": chunk},
-                    ],
-                    max_tokens=max_comp,
-                    temperature=0.1,
+                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+                if prev_tail:
+                    messages.append({"role": "assistant", "content": prev_tail})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                            }
+                        ],
+                    }
                 )
-                comp_toks = resp.usage.completion_tokens or max_comp
-                await limiter.commit(prompt_toks + chunk_toks + comp_toks)
 
-                text = resp.choices[0].message.content or ""
-                return strip_code_fence(text)
-            except (RateLimitError, APIConnectionError, APITimeoutError) as e:
-                if attempt == RETRIES - 1:
+                resp = await client.chat.completions.create(
+                    model      = MODEL_NAME,
+                    # let the model decide the best completion length
+                    temperature=0.0,
+                    messages   = messages,
+                )
+
+
+                usage = resp.usage
+                await tpm_limiter.commit(
+                    usage.prompt_tokens + usage.completion_tokens,
+                    reserved,
+                )
+                return resp.choices[0].message.content or ""
+
+            except (BadRequestError, RateLimitError, APIConnectionError,
+                    APITimeoutError, OpenAIError) as exc:
+                # release the reserved bucket before retrying
+                await tpm_limiter.commit(0, reserved)
+            
+                if attempt >= MAX_RETRIES:
                     raise
-                wait = 2 ** attempt + random.random()
-                log.warning(f"{type(e).__name__}: {e}; retrying in {wait:.1f}s")
-                await asyncio.sleep(wait)
-            except OpenAIError:
-                raise
+                backoff = 2 ** attempt + random.random()
+                log.warning("Page %d failed (%s) – retrying in %.1f s (%d/%d)",
+                            page_num, exc, backoff, attempt + 1, MAX_RETRIES)
+                await asyncio.sleep(backoff)
 
-async def run_pipeline(input_pdf: Path, output_txt: Path, model: str):
-    paras   = read_pdf(input_pdf)
-    chunks  = split_paragraphs(paras, model)
-    total   = len(chunks)
-    log.info(f"{total} chunks queued with {model}")
+# ──────────────────────────────────────────────────────────────────────────────
+# Pipeline
+# ──────────────────────────────────────────────────────────────────────────────
+async def run_pipeline(
+    pdf_path : Path,
+    out_path : Path | None = None,
+    *,
+    dpi: int = 200,
+) -> str:
+    """OCR a PDF *sequentially*, saving progress every `SAVE_EVERY` pages."""
+    transcript, buffer_pages = [], []
+    prev_tail : str | None   = None
+    total_pages              = fitz.open(pdf_path).page_count   # cheap metadata call
 
-    out_lines = [(
-        f"--- OCR/Extraction Report ---\n"
-        f"Model: {model}\n"
-        f"Date:  {datetime.now():%Y-%m-%d %H:%M}\n"
-        f"Source file: {input_pdf.name}\n"
-        f"---\n\n"
-    )]
+    for pageno, image_b64 in enumerate(iter_page_images_b64(pdf_path, dpi=dpi), 1):
+        page_text = await ocr_page(image_b64, pageno, prev_tail)
+        transcript.append(page_text)
+        buffer_pages.append(page_text)
+        prev_tail = last_sentences(page_text)
 
-    limiter   = TokenLimiter(model)
-    tasks = [extract(ch, model, limiter, i, total)
-             for i, ch in enumerate(chunks, 1)]
-    for i, result in enumerate(await asyncio.gather(*tasks), 1):
-        out_lines.append(f"-- Section {i} --\n{result}\n\n" if result.strip()
-                         else f"-- Section {i} --\n\n")
+        log.info("Processed page %d / %d", pageno, total_pages)
+            
+        if out_path and pageno % SAVE_EVERY == 0:
+            # append last 5 pages to the *main* file
+            with open(out_path, "a", encoding="utf-8") as f:
+                f.write("".join(buffer_pages))
+            buffer_pages.clear()
+        
+            # also write full checkpoint with everything so far
+            checkpoint = out_path.with_name(f"{out_path.stem}_sofar_page{pageno}.txt")
+            with open(checkpoint, "w", encoding="utf-8") as cp:
+                cp.write("\n\n".join(transcript) + "\n")
+        
+            log.info("Progress saved through page %d → %s  (checkpoint → %s)",
+                     pageno, out_path, checkpoint)
 
-        if i % WRITE_EVERY == 0 or i == total:
-            ckpt = output_txt.with_suffix(f".p{i:03d}{output_txt.suffix}")
-            ckpt.write_text("".join(out_lines), encoding="utf-8")
-            log.info(f"Checkpoint saved: {ckpt.name}")
 
-    output_txt.write_text("".join(out_lines), encoding="utf-8")
-    log.info(f"Done → {output_txt}")
+    if out_path and buffer_pages:
+        with open(out_path, "a", encoding="utf-8") as f:
+            f.write("\n\n".join(buffer_pages) + "\n\n")
+        log.info("Final pages written → %s", out_path)
 
-def start_async(coro):
+    return "\n\n".join(transcript)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public convenience wrappers
+# ──────────────────────────────────────────────────────────────────────────────
+import threading
+from pathlib import Path
+
+async def easy_ocr_async(
+    pdf_path: str | Path,
+    out_path: str | Path | None = None,
+    *,
+    dpi: int = 200,
+) -> str:
+    _pdf = Path(pdf_path)
+    if out_path is None:
+        ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        _out = _pdf.with_name(f"{_pdf.stem}_{ts}.txt")
+    else:
+        _out = Path(out_path)
+    return await run_pipeline(_pdf, _out, dpi=dpi)
+
+
+
+def easy_ocr(
+    pdf_path: Path | str = "input.pdf",
+    out_path: Path | str | None = None,
+    *,
+    dpi: int = 200,
+) -> str:
+    """
+    Synchronous helper.
+
+    • In a regular script (no loop running) it simply blocks with `asyncio.run()`.
+    • In an interactive session *with* a running loop it transparently spins up
+      a worker thread, runs the coroutine there, waits, and finally returns the
+      text – so **one plain call does the work everywhere**.
+    """
     try:
-        loop = asyncio.get_running_loop()
+        asyncio.get_running_loop()             # Is a loop already running?
     except RuntimeError:
-        loop = None
-    if loop and loop.is_running():
-        import nest_asyncio; nest_asyncio.apply()
-        return loop.run_until_complete(coro)
-    return asyncio.run(coro)
+        # No → classic blocking path
+        return asyncio.run(easy_ocr_async(pdf_path, out_path, dpi=dpi))
 
-def easy_extract(model: str = DEFAULT_MODEL,
-                 input_pdf: str = "input.pdf",
-                 output_txt: str = None):
-    inp   = Path(input_pdf).resolve()
-    now   = datetime.now().strftime("%Y%m%d_%H%M")
-    out   = Path(output_txt) if output_txt else inp.with_name(
-           f"ocr_extract_{model}_{now}.txt")
-    if os.name == "nt":
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    print(f"\n→ Extracting {inp.name} with {model}\n")
-    start_async(run_pipeline(inp, out, model))
-    print(f"\n✓ Output written to {out}\n")
+    # Yes → run in a background thread instead of nesting loops
+    result_holder: list[str] = []
+    error_holder: list[BaseException] = []
 
-# ---------- CLI ----------
+    def _worker() -> None:
+        try:
+            result_holder.append(
+                asyncio.run(easy_ocr_async(pdf_path, out_path, dpi=dpi))
+            )
+        except BaseException as e:
+            error_holder.append(e)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join()
+
+    if error_holder:                            # re-raise inside caller thread
+        raise error_holder[0]
+    return result_holder[0]
+
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Simple CLI
+# ──────────────────────────────────────────────────────────────────────────────
+def _parse_args(argv: Sequence[str]):
+    import argparse
+    p = argparse.ArgumentParser(description="OCR a PDF with GPT-4o Vision.")
+    p.add_argument("--input", "-i", default="input.pdf", help="Input PDF file")
+    p.add_argument("--output", "-o", help="Output text file")
+    p.add_argument("--dpi", type=int, default=200, help="Render DPI (default 200)")
+    return p.parse_args(argv)
+
+def _cli_entry(argv: Sequence[str]) -> None:
+    args = _parse_args(argv)
+    pdf_path = Path(args.input)
+    if args.output:
+        out_path = Path(args.output)
+    else:
+        ts       = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        out_path = pdf_path.with_name(f"{pdf_path.stem}_{ts}.txt")
+
+    asyncio.run(run_pipeline(pdf_path, out_path, dpi=args.dpi))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# __main__
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
     if len(sys.argv) > 1:
-        import argparse
-        p = argparse.ArgumentParser(description="Extract PDF text via OpenAI.")
-        p.add_argument("--model",  choices=AVAILABLE_MODELS, default=DEFAULT_MODEL)
-        p.add_argument("--input",  default="input.pdf", help="PDF file path")
-        p.add_argument("--output", help="Output TXT (optional)")
-        args = p.parse_args()
-        start_async(run_pipeline(Path(args.input),
-                             Path(args.output) if args.output else
-                             Path(f"ocr_extract_{args.model}_{datetime.now():%Y%m%d_%H%M}.txt"),
-                             args.model))
+        _cli_entry(sys.argv[1:])
+    else:
+        log.info(
+            "opanai_ocr module imported (no CLI args) – ready for easy_ocr()."
+        )
